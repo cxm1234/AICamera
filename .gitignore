@@ -1,0 +1,36 @@
+# macOS
+.DS_Store
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcuserdatad/
+xcuserdata/
+*.swp
+*.swo
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# XcodeGen 产物：由 project.yml 生成，不入库
+AICamera.xcodeproj/
+
+# Swift Package Manager
+.swiftpm/
+.build/
+Packages/
+Package.pins
+Package.resolved
+*.xcodeproj/project.xcworkspace/xcuserdata
+*.xcworkspace/xcuserdata
+
+# CocoaPods / Carthage（本工程未用，留着以防）
+Pods/
+Carthage/Build/
+
+# IDE
+.vscode/
+.idea/
