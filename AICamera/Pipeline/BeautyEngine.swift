@@ -15,9 +15,12 @@ struct BeautyEngine: Sendable {
         guard settings.enabled else { return image }
         var result = image
 
-        // 1) 磨皮（最贵，先降采样、再上采样）
+        // 1) 磨皮（最贵，先降采样、再上采样；可选 face-mask）
         if settings.smoothing > 0.005 {
-            result = smoothSkin(result, intensity: settings.smoothing, scale: downsampleScale)
+            result = smoothSkin(result,
+                                intensity: settings.smoothing,
+                                faces: faces,
+                                scale: downsampleScale)
         }
         // 2) 美白（曲线 + 略微提饱和）
         if settings.whitening > 0.005 {
@@ -39,40 +42,140 @@ struct BeautyEngine: Sendable {
         return result.cropped(to: image.extent)
     }
 
-    // MARK: - 磨皮（双边滤波 + 原图融合）
+    // MARK: - 磨皮（频率分离 + 高频衰减 + 人脸柔边 mask）
+    //
+    // 算法：
+    //   low  = GaussianBlur(image, large)         // 低频：肤色与瑕疵
+    //   high = image - low + 0.5                  // 高频：皮肤纹理与边缘
+    //   high'= (high - 0.5) * (1 - k * i) + 0.5   // 衰减高频强度（k=0.85）
+    //   smooth = low + (high' - 0.5)              // 重构：保留结构、去掉颗粒
+    //   mask = 椭圆柔边（按 face boundingBox），无脸时退化为整图
+    //   final = blend(smooth, image, mask * pow(i, 0.65))
+    //
+    // 这是 Snapseed / Facetune 同源的"频率分离"磨皮。intensity=1 时高频近乎抹平
+    // 形成瓷感；intensity=0.5 时衰减 ~42%，肤色细腻但五官锐度保留。
+    private func smoothSkin(_ image: CIImage,
+                            intensity: Double,
+                            faces: [FaceObservation],
+                            scale: CGFloat) -> CIImage {
+        let i = max(0, min(1, intensity))
+        let extent = image.extent
 
-    private func smoothSkin(_ image: CIImage, intensity: Double, scale: CGFloat) -> CIImage {
+        // 1) 降采样（默认 0.5x）
         let s = max(0.3, min(1.0, scale))
-        let downscaled: CIImage
+        let down: CIImage
         if abs(s - 1.0) > 0.01 {
             let f = CIFilter.lanczosScaleTransform()
             f.inputImage = image
             f.scale = Float(s)
             f.aspectRatio = 1.0
-            downscaled = f.outputImage ?? image
+            down = (f.outputImage ?? image)
         } else {
-            downscaled = image
+            down = image
         }
+        let downExtent = down.extent
 
-        // 双边滤波：CINoiseReduction 在保边平滑上效果好且性能稳定
-        let nr = CIFilter.noiseReduction()
-        nr.inputImage = downscaled
-        nr.noiseLevel = Float(0.02 + 0.10 * intensity)
-        nr.sharpness  = Float(0.40)
-        let blurred = nr.outputImage ?? downscaled
+        // 2) 低频（强高斯模糊）
+        let blur = CIFilter.gaussianBlur()
+        blur.inputImage = down.clampedToExtent()
+        blur.radius = Float(3.0 + 9.0 * i)              // 3..12 in 0.5x 空间
+        let lowFreq = (blur.outputImage ?? down).cropped(to: downExtent)
 
-        let upscaled: CIImage
+        // 3) 高频 = down - lowFreq + 0.5
+        let sub = CIFilter.subtractBlendMode()
+        sub.inputImage = down
+        sub.backgroundImage = lowFreq
+        let detailRaw = (sub.outputImage ?? down).cropped(to: downExtent)
+        let detailShifted = detailRaw.applyingFilter("CIColorMatrix", parameters: [
+            "inputBiasVector": CIVector(x: 0.5, y: 0.5, z: 0.5, w: 0)
+        ])
+
+        // 4) 高频衰减
+        let strength = CGFloat(1.0 - 0.85 * i)
+        let bias = 0.5 * (1 - strength)
+        let detailAtt = detailShifted.applyingFilter("CIColorMatrix", parameters: [
+            "inputRVector":    CIVector(x: strength, y: 0, z: 0, w: 0),
+            "inputGVector":    CIVector(x: 0, y: strength, z: 0, w: 0),
+            "inputBVector":    CIVector(x: 0, y: 0, z: strength, w: 0),
+            "inputAVector":    CIVector(x: 0, y: 0, z: 0, w: 1),
+            "inputBiasVector": CIVector(x: bias, y: bias, z: bias, w: 0)
+        ])
+
+        // 5) 重组 lowFreq + (detailAtt - 0.5)
+        let add = CIFilter.additionCompositing()
+        add.inputImage = detailAtt
+        add.backgroundImage = lowFreq
+        let combined = (add.outputImage ?? down).cropped(to: downExtent)
+        let smoothedDown = combined.applyingFilter("CIColorMatrix", parameters: [
+            "inputBiasVector": CIVector(x: -0.5, y: -0.5, z: -0.5, w: 0)
+        ])
+
+        // 6) 上采样回原尺寸
+        let smoothed: CIImage
         if abs(s - 1.0) > 0.01 {
-            let up = CIFilter.lanczosScaleTransform()
-            up.inputImage = blurred
-            up.scale = Float(1.0 / s)
-            up.aspectRatio = 1.0
-            upscaled = (up.outputImage ?? blurred).cropped(to: image.extent)
+            let u = CIFilter.lanczosScaleTransform()
+            u.inputImage = smoothedDown
+            u.scale = Float(1.0 / s)
+            u.aspectRatio = 1.0
+            smoothed = (u.outputImage ?? smoothedDown).cropped(to: extent)
         } else {
-            upscaled = blurred
+            smoothed = smoothedDown
         }
 
-        return alphaBlend(upscaled, over: image, alpha: intensity)
+        // 7) 用 face mask 限制只磨脸；强度走感知曲线 pow(i, 0.65)
+        let mask = makeFaceMask(in: extent, faces: faces, intensity: i)
+
+        let blend = CIFilter.blendWithMask()
+        blend.inputImage = smoothed
+        blend.backgroundImage = image
+        blend.maskImage = mask
+        return (blend.outputImage ?? image).cropped(to: extent)
+    }
+
+    /// 构造柔边人脸 mask（白=磨皮，黑=保留原图）。
+    /// - 无脸：整图均匀强度 = pow(i, 0.65)
+    /// - 有脸：每张脸一个 radial gradient，叠加并 clamp 到 [0,1]
+    private func makeFaceMask(in extent: CGRect,
+                              faces: [FaceObservation],
+                              intensity: Double) -> CIImage {
+        let strength = CGFloat(pow(intensity, 0.65))
+
+        if faces.isEmpty {
+            return CIImage(color: CIColor(red: strength, green: strength, blue: strength, alpha: 1))
+                .cropped(to: extent)
+        }
+
+        var combined = CIImage(color: .black).cropped(to: extent)
+        let span = max(extent.width, extent.height)
+        for face in faces {
+            let center = CGPoint(
+                x: extent.origin.x + face.boundingBox.midX * extent.width,
+                y: extent.origin.y + face.boundingBox.midY * extent.height
+            )
+            // 用脸部包围盒短边作为基准，r0 = 实心区域，r1 = 完全衰减半径
+            let faceSpan = max(face.boundingBox.width, face.boundingBox.height) * span
+            let r0 = faceSpan * 0.45
+            let r1 = faceSpan * 0.78
+
+            let g = CIFilter.radialGradient()
+            g.center  = center
+            g.radius0 = Float(r0)
+            g.radius1 = Float(r1)
+            g.color0  = CIColor(red: strength, green: strength, blue: strength, alpha: 1)
+            g.color1  = CIColor(red: 0, green: 0, blue: 0, alpha: 1)
+            let layer = (g.outputImage ?? combined).cropped(to: extent)
+
+            let merge = CIFilter.additionCompositing()
+            merge.inputImage = layer
+            merge.backgroundImage = combined
+            combined = (merge.outputImage ?? combined).cropped(to: extent)
+        }
+
+        let clamp = CIFilter.colorClamp()
+        clamp.inputImage = combined
+        clamp.minComponents = CIVector(x: 0, y: 0, z: 0, w: 0)
+        clamp.maxComponents = CIVector(x: 1, y: 1, z: 1, w: 1)
+        return (clamp.outputImage ?? combined).cropped(to: extent)
     }
 
     // MARK: - 美白（提亮 + 略微降饱和保留肤色，再轻微暖色补偿）
@@ -98,8 +201,8 @@ struct BeautyEngine: Sendable {
     private func sharpen(_ image: CIImage, intensity: Double) -> CIImage {
         let f = CIFilter.unsharpMask()
         f.inputImage = image
-        f.radius    = Float(1.2)
-        f.intensity = Float(0.4 * intensity)
+        f.radius    = Float(1.4)
+        f.intensity = Float(0.85 * intensity)
         return f.outputImage ?? image
     }
 
