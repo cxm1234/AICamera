@@ -25,7 +25,7 @@ struct ModeSelector: View {
         }
         .padding(4)
         .background(Theme.Color.surfaceStrong, in: Capsule(style: .continuous))
-        .frame(maxWidth: 280)
+        .frame(maxWidth: 340)
         .frame(maxWidth: .infinity)
     }
 

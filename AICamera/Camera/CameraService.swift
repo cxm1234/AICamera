@@ -122,6 +122,171 @@ actor CameraService {
         }
     }
 
+    // MARK: - Pro controls
+
+    func capabilities() -> DeviceCapabilities {
+        guard let device = videoInput?.device else { return .empty }
+        let format = device.activeFormat
+        let minD = CMTimeGetSeconds(format.minExposureDuration)
+        let maxD = min(CMTimeGetSeconds(format.maxExposureDuration), 0.5)
+        let minBias = device.minExposureTargetBias
+        let maxBias = device.maxExposureTargetBias
+
+        return DeviceCapabilities(
+            minISO: format.minISO,
+            maxISO: format.maxISO,
+            minShutter: minD,
+            maxShutter: maxD,
+            minBiasEV: max(minBias, -2),
+            maxBiasEV: min(maxBias, 2),
+            maxZoom:  format.videoMaxZoomFactor,
+            lensStops: lensStops(for: device),
+            supportsCustomExposure: device.isExposureModeSupported(.custom),
+            supportsManualFocus: device.isFocusModeSupported(.locked) && device.isLockingFocusWithCustomLensPositionSupported,
+            deviceLabel: deviceDisplayLabel(device)
+        )
+    }
+
+    func setExposureMode(_ mode: ExposureMode) {
+        guard let device = videoInput?.device else { return }
+        let target: AVCaptureDevice.ExposureMode = (mode == .auto) ? .continuousAutoExposure : .custom
+        guard device.isExposureModeSupported(target) else { return }
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            device.exposureMode = target
+        } catch {
+            log.error("setExposureMode failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// 将 ISO 或快门设到自定义曝光（device 必须支持 .custom）。
+    func setManualExposure(iso: Float?, shutterSeconds: Double?) {
+        guard let device = videoInput?.device, device.isExposureModeSupported(.custom) else { return }
+        let format = device.activeFormat
+        let isoTarget: Float = iso.map { max(format.minISO, min(format.maxISO, $0)) }
+            ?? AVCaptureDevice.currentISO
+        let shutterTarget: CMTime
+        if let sec = shutterSeconds {
+            let minSec = CMTimeGetSeconds(format.minExposureDuration)
+            let maxSec = min(CMTimeGetSeconds(format.maxExposureDuration), 0.5)
+            let clamped = max(minSec, min(maxSec, sec))
+            shutterTarget = CMTime(seconds: clamped, preferredTimescale: 1_000_000_000)
+        } else {
+            shutterTarget = AVCaptureDevice.currentExposureDuration
+        }
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            if device.exposureMode != .custom { device.exposureMode = .custom }
+            device.setExposureModeCustom(duration: shutterTarget, iso: isoTarget, completionHandler: nil)
+        } catch {
+            log.error("setManualExposure failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    func setExposureBias(_ ev: Float) {
+        guard let device = videoInput?.device else { return }
+        let clamped = max(device.minExposureTargetBias, min(device.maxExposureTargetBias, ev))
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            device.setExposureTargetBias(clamped, completionHandler: nil)
+        } catch {
+            log.error("setExposureBias failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    func setFocusMode(_ mode: FocusMode) {
+        guard let device = videoInput?.device else { return }
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            switch mode {
+            case .auto:
+                if device.isFocusModeSupported(.continuousAutoFocus) {
+                    device.focusMode = .continuousAutoFocus
+                }
+            case .manual:
+                if device.isFocusModeSupported(.locked) && device.isLockingFocusWithCustomLensPositionSupported {
+                    device.focusMode = .locked
+                }
+            }
+        } catch {
+            log.error("setFocusMode failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    func setLensPosition(_ pos: Float) {
+        guard let device = videoInput?.device,
+              device.isLockingFocusWithCustomLensPositionSupported else { return }
+        let clamped = max(0, min(1, pos))
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            device.setFocusModeLocked(lensPosition: clamped, completionHandler: nil)
+        } catch {
+            log.error("setLensPosition failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// 切到指定焦段；smooth=true 时使用 ramp，false 直接赋值。
+    func setZoomStop(_ stop: LensZoomStop, smooth: Bool) {
+        guard let device = videoInput?.device else { return }
+        let clamped = max(1.0, min(device.activeFormat.videoMaxZoomFactor, stop.factor))
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            if device.isRampingVideoZoom {
+                device.cancelVideoZoomRamp()
+            }
+            if smooth {
+                device.ramp(toVideoZoomFactor: clamped, withRate: 6.0)
+            } else {
+                device.videoZoomFactor = clamped
+            }
+            configuration.zoomFactor = clamped
+        } catch {
+            log.error("setZoomStop failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// 长按预览：锁定 AE/AF。返回是否成功。
+    @discardableResult
+    func lockAEAF() -> Bool {
+        guard let device = videoInput?.device else { return false }
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            if device.isFocusModeSupported(.locked) {
+                device.focusMode = .locked
+            }
+            if device.isExposureModeSupported(.locked) {
+                device.exposureMode = .locked
+            }
+            return true
+        } catch {
+            log.error("lockAEAF failed: \(error.localizedDescription, privacy: .public)")
+            return false
+        }
+    }
+
+    func unlockAEAF() {
+        guard let device = videoInput?.device else { return }
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            if device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusMode = .continuousAutoFocus
+            }
+            if device.isExposureModeSupported(.continuousAutoExposure) {
+                device.exposureMode = .continuousAutoExposure
+            }
+        } catch {
+            log.error("unlockAEAF failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
     // MARK: - Capture
 
     /// 拍照。返回原图像素缓冲（已应用方向），由调用方继续处理（滤镜/美颜）+ 落盘。
@@ -227,6 +392,62 @@ actor CameraService {
             if let d = AVCaptureDevice.default(type, for: .video, position: position) { return d }
         }
         return AVCaptureDevice.default(for: .video)
+    }
+
+    /// 根据当前 device 探测可用的多镜头变焦档位。
+    /// - 物理设备只有单镜头：返回 [1×]
+    /// - 虚拟设备（双 / 三摄）：用 `virtualDeviceSwitchOverVideoZoomFactors` + 是否带 ultrawide 决定档位
+    private func lensStops(for device: AVCaptureDevice) -> [LensZoomStop] {
+        let maxZoom = device.activeFormat.videoMaxZoomFactor
+        var stops: [LensZoomStop] = []
+
+        let constituents = device.constituentDevices
+        let hasUltraWide = constituents.contains { $0.deviceType == .builtInUltraWideCamera }
+            || device.deviceType == .builtInUltraWideCamera
+
+        if hasUltraWide {
+            stops.append(LensZoomStop(label: "0.5×", factor: 1.0)) // 虚拟相机的 1.0 = 广角，超广角通过 0.5 表示在 UI 上
+        }
+
+        // 1× 总是可用
+        let oneXFactor: CGFloat = hasUltraWide ? 2.0 : 1.0
+        stops.append(LensZoomStop(label: "1×", factor: oneXFactor))
+
+        // 2×：广角自适应（虚拟相机的 2x 通常对应 4，单镜头则 2）
+        if maxZoom >= oneXFactor * 2 {
+            stops.append(LensZoomStop(label: "2×", factor: oneXFactor * 2))
+        }
+
+        // 3× / 5×：使用 virtual device 的切换点
+        for cross in device.virtualDeviceSwitchOverVideoZoomFactors {
+            let f = CGFloat(truncating: cross)
+            // 跳过已包含的档位
+            if stops.contains(where: { abs($0.factor - f) < 0.05 }) { continue }
+            let displayed = f / oneXFactor
+            let label: String
+            if displayed >= 4.5 {
+                label = "5×"
+            } else if displayed >= 2.5 {
+                label = "3×"
+            } else {
+                continue
+            }
+            stops.append(LensZoomStop(label: label, factor: f))
+        }
+
+        return stops
+    }
+
+    private func deviceDisplayLabel(_ device: AVCaptureDevice) -> String {
+        switch device.deviceType {
+        case .builtInTripleCamera:    return "Triple"
+        case .builtInDualCamera:      return "Dual"
+        case .builtInDualWideCamera:  return "Dual Wide"
+        case .builtInWideAngleCamera: return "Wide"
+        case .builtInUltraWideCamera: return "Ultra Wide"
+        case .builtInTelephotoCamera: return "Tele"
+        default:                      return device.localizedName
+        }
     }
 
     private func makePhotoSettings() -> AVCapturePhotoSettings {

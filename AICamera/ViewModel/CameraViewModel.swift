@@ -27,6 +27,13 @@ final class CameraViewModel {
     var countdownRemaining: Int = 0
     var availableFilters: [FilterPreset] = FilterPreset.all
 
+    // MARK: - Pro 模式状态
+
+    var pro: ProSettings = .init()
+    var caps: DeviceCapabilities = .empty
+    var histogram: HistogramBins?
+    var level: LevelReading = .zero
+
     // MARK: - 渲染桥（注入到 PreviewView）
 
     let previewBox = CameraPreviewView.Box()
@@ -36,8 +43,11 @@ final class CameraViewModel {
     private let cameraService = CameraService()
     private let photoSaver = PhotoLibrarySaver()
     private let faceDetector = FaceDetector()
+    private let histogramSampler = HistogramSampler()
+    private let levelSensor = LevelSensor()
     private var processor: FrameProcessor?
     private var frameTask: Task<Void, Never>?
+    private var histogramTask: Task<Void, Never>?
     private var countdownTask: Task<Void, Never>?
     private let log = Logger(subsystem: "com.aicamera", category: "vm")
     private let signpost = OSSignposter(subsystem: "com.aicamera", category: "vm")
@@ -60,6 +70,9 @@ final class CameraViewModel {
         do {
             try await cameraService.start()
             HapticsManager.shared.prepare()
+            await refreshCapabilities()
+            startHistogramPolling()
+            applyProModeSideEffects(force: true)
         } catch {
             present(error)
         }
@@ -68,6 +81,9 @@ final class CameraViewModel {
     func onDisappear() async {
         frameTask?.cancel()
         frameTask = nil
+        histogramTask?.cancel()
+        histogramTask = nil
+        levelSensor.stop()
         await cameraService.stop()
     }
 
@@ -112,7 +128,78 @@ final class CameraViewModel {
     func selectMode(_ m: CameraMode) {
         guard mode != m else { return }
         mode = m
+        applyProModeSideEffects(force: false)
         HapticsManager.shared.soft()
+    }
+
+    // MARK: - Pro 用户意图
+
+    func setExposureMode(_ m: ExposureMode) {
+        pro.exposureMode = m
+        Task { await cameraService.setExposureMode(m) }
+        // 切到 manual 时，把当前 ISO/Shutter 推给 device，避免值为 NaN
+        if m == .manual {
+            let iso = pro.iso
+            let s = pro.shutterSeconds
+            Task { await cameraService.setManualExposure(iso: iso, shutterSeconds: s) }
+        }
+        HapticsManager.shared.tick()
+    }
+
+    func setISO(_ value: Float) {
+        let clamped = max(caps.minISO, min(caps.maxISO, value))
+        pro.iso = clamped
+        Task { await cameraService.setManualExposure(iso: clamped, shutterSeconds: nil) }
+    }
+
+    func setShutter(seconds: Double) {
+        let clamped = max(caps.minShutter, min(caps.maxShutter, seconds))
+        pro.shutterSeconds = clamped
+        Task { await cameraService.setManualExposure(iso: nil, shutterSeconds: clamped) }
+    }
+
+    func setEV(_ ev: Float) {
+        let clamped = max(caps.minBiasEV, min(caps.maxBiasEV, ev))
+        pro.exposureBiasEV = clamped
+        Task { await cameraService.setExposureBias(clamped) }
+    }
+
+    func setFocusMode(_ m: FocusMode) {
+        pro.focusMode = m
+        Task { await cameraService.setFocusMode(m) }
+        if m == .manual {
+            let pos = pro.lensPosition
+            Task { await cameraService.setLensPosition(pos) }
+        }
+        HapticsManager.shared.tick()
+    }
+
+    func setLensPosition(_ pos: Float) {
+        let clamped = max(0, min(1, pos))
+        pro.lensPosition = clamped
+        Task { await cameraService.setLensPosition(clamped) }
+    }
+
+    func selectZoomStop(_ stop: LensZoomStop) {
+        configuration.zoomFactor = stop.factor
+        Task { await cameraService.setZoomStop(stop, smooth: true) }
+        HapticsManager.shared.tick()
+    }
+
+    func toggleAEAFLock() {
+        if pro.lockedAEAF {
+            pro.lockedAEAF = false
+            Task { await cameraService.unlockAEAF() }
+        } else {
+            Task {
+                let ok = await cameraService.lockAEAF()
+                await MainActor.run {
+                    self.pro.lockedAEAF = ok
+                    if !ok { self.toast = ToastMessage(text: "当前镜头不支持锁定") }
+                }
+            }
+        }
+        HapticsManager.shared.medium()
     }
 
     func selectFilter(_ preset: FilterPreset) {
@@ -156,6 +243,8 @@ final class CameraViewModel {
                 try await cameraService.switchCamera()
                 let cfg = await cameraService.configuration
                 configuration.position = cfg.position
+                pro.lockedAEAF = false
+                await refreshCapabilities()
                 HapticsManager.shared.soft()
             } catch {
                 present(error)
@@ -201,8 +290,54 @@ final class CameraViewModel {
 
     private func attachProcessorIfNeeded() {
         guard processor == nil, let renderer = previewBox.renderer else { return }
-        processor = FrameProcessor(faceDetector: faceDetector, sink: renderer)
+        processor = FrameProcessor(faceDetector: faceDetector,
+                                   sink: renderer,
+                                   histogramSampler: histogramSampler)
         syncProcessorContext()
+    }
+
+    // MARK: - Pro 内部辅助
+
+    private func refreshCapabilities() async {
+        let snapshot = await cameraService.capabilities()
+        self.caps = snapshot
+        // 让 pro.iso/shutter/lensPosition 落入新 caps 范围
+        pro.iso = max(snapshot.minISO, min(snapshot.maxISO, pro.iso))
+        pro.shutterSeconds = max(snapshot.minShutter, min(snapshot.maxShutter, pro.shutterSeconds))
+        pro.exposureBiasEV = max(snapshot.minBiasEV, min(snapshot.maxBiasEV, pro.exposureBiasEV))
+        pro.lensPosition = max(0, min(1, pro.lensPosition))
+        if !snapshot.supportsCustomExposure { pro.exposureMode = .auto }
+        if !snapshot.supportsManualFocus    { pro.focusMode    = .auto }
+    }
+
+    private func startHistogramPolling() {
+        histogramTask?.cancel()
+        histogramTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                if let bins = self?.histogramSampler.latest, self?.mode == .pro {
+                    self?.histogram = bins
+                }
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+        }
+    }
+
+    /// Pro 模式进入/离开时启停水平仪。
+    private func applyProModeSideEffects(force: Bool) {
+        if mode == .pro {
+            levelSensor.start { [weak self] reading in
+                self?.level = reading
+            }
+        } else {
+            levelSensor.stop()
+            level = .zero
+            // 离开 Pro 模式时主动解锁 AE/AF，避免 user 误以为系统卡死
+            if pro.lockedAEAF {
+                pro.lockedAEAF = false
+                Task { await cameraService.unlockAEAF() }
+            }
+        }
+        if force, mode != .pro { /* no-op */ }
     }
 
     private func startStreaming() async {

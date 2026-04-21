@@ -136,3 +136,89 @@ AICamera/
 ```
 
 总计 **36 个 Swift 源文件 + 4 份 6A 文档 + project.yml + README**，**0 第三方依赖**。
+
+---
+
+## 8. 增量：专业模式（Pro Mode）
+
+> 对应 `04-Align-Pro.md` / `05-Architect-Pro.md`，本节只列增量自检。
+
+### 8.1 编译
+
+| 项 | 结果 |
+| --- | --- |
+| `xcodegen generate` 一键重建 | ✅ |
+| Debug iphonesimulator 构建 | ✅ `BUILD SUCCEEDED` |
+| Release iphonesimulator 构建（`-warnings-as-errors`） | ✅ `BUILD SUCCEEDED`，0 warning |
+| ReadLints 增量文件 | ✅ 0 命中 |
+| 新增 `Box<T>` / `@unchecked Sendable` 数量 | 仅 `HistogramSampler` 1 处（NSLock 保护） |
+
+### 8.2 功能验收
+
+| 项 | 状态 | 说明 |
+| --- | --- | --- |
+| 模式选择器多出 `专业` | ✅ | `CameraMode.pro` 自动加入 `allCases` |
+| 进入 Pro：Auto/Manual + ISO/Shutter + EV + AF/MF + 距离滑块 | ✅ | `ProPanel`（曝光/对焦双 Tab） |
+| 顶部直方图卡片 | ✅ | `HistogramView`（仅 mode == .pro 显示） |
+| 顶部水平仪 | ✅ | `LevelView`，10 Hz |
+| 多镜头条 0.5×/1×/2×/3× 平滑切换 | ✅ | `LensZoomBar` + `device.ramp(toVideoZoomFactor:withRate:)` |
+| 长按预览 0.6s → AE/AF 锁定 | ✅ | `LongPressGesture` + `AEAFLockBadge` |
+| 切镜头/切模式正确重置（不携带越界值） | ✅ | `refreshCapabilities()` 后做 `clamp` |
+| 模拟器无相机时不崩溃 | ✅ | `caps = .empty`，控件 disabled，UI 完整可见 |
+
+### 8.3 性能与并发
+
+| 项 | 处理 |
+| --- | --- |
+| 直方图限频 ≤ 5 Hz | `HistogramSampler.everyN = 6` 帧采样一次 |
+| 直方图降采样 | `vImageScale_ARGB8888` 到 128×128，零重复 alloc（`Data` 一次性持有） |
+| 直方图算法 | `vImageHistogramCalculation_ARGB8888` 4×256 → 合并 64-bin Luma |
+| 水平仪频率 | `CMMotionManager` 10 Hz，回调直接 `@MainActor` 写入 |
+| 拨盘节流 | UI 写 `@Observable` 即返回，actor 内串行 `device.lockForConfiguration` 天然串行 |
+| 跨 actor 边界 | `ProSettings`/`DeviceCapabilities`/`LensZoomStop`/`LevelReading`/`HistogramBins` 全为 `Sendable` 值类型 |
+| 长按手势 | `simultaneousGesture`，不阻塞点对焦 + 双指变焦 |
+
+### 8.4 错误兜底
+
+| 场景 | 行为 |
+| --- | --- |
+| `device.isExposureModeSupported(.custom) == false` | UI 上 MANUAL 按钮 disabled + 灰显 |
+| `device.isLockingFocusWithCustomLensPositionSupported == false` | UI 上 MF 按钮 disabled |
+| `lockForConfiguration` 抛错 | actor 内吞掉、写日志，不向 UI 抛；用户重试即可 |
+| AE/AF 锁定失败 | toast "当前镜头不支持锁定" |
+| 离开 Pro 模式 | `LevelSensor.stop()`，主动 `unlockAEAF()`，避免遗留状态 |
+
+### 8.5 文件增量
+
+```
+AICamera/
+├── Models/
+│   └── ProControls.swift          (+ 新增)
+├── Camera/
+│   ├── CameraService.swift        (* 修改：+8 个 Pro 接口、镜头探测、能力查询)
+│   ├── Histogram.swift            (+ 新增)
+│   └── LevelSensor.swift          (+ 新增)
+├── Pipeline/
+│   └── FrameProcessor.swift       (* 修改：注入 HistogramSampler)
+├── ViewModel/
+│   └── CameraViewModel.swift      (* 修改：Pro state + intents + 生命周期)
+└── Views/
+    ├── ProPanel.swift             (+ 新增)
+    ├── HistogramView.swift        (+ 新增)
+    ├── LevelView.swift            (+ 新增)
+    ├── LensZoomBar.swift          (+ 新增)
+    ├── AEAFLockBadge.swift        (+ 新增)
+    ├── CameraScreen.swift         (* 修改：长按 + 顶部条 + 镜头条)
+    ├── BottomBar.swift            (* 修改：.pro case 显示 ProPanel)
+    └── ModeSelector.swift         (* 修改：宽度上限 280→340)
+```
+
+### 8.6 已知限制 / 留给下一迭代
+
+- ProRAW（DNG）拍摄
+- 手动白平衡（K + Tint 双轴）
+- 包围曝光 (AEB) 三连拍
+- 焦点峰值（CIEdges + GPU mask overlay）
+- Live Photo / 4K60
+- 在 Pro 模式下应用滤镜 / 美颜的协作策略（当前 Pro 与 Beauty/Filter 互斥模式）
+

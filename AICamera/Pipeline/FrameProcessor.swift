@@ -25,6 +25,7 @@ final class FrameProcessor: @unchecked Sendable {
     private let filterEngine = FilterEngine()
     private let beautyEngine = BeautyEngine()
     private let faceDetector: FaceDetector
+    private let histogramSampler: HistogramSampler?
     private weak var sink: FrameSink?
 
     private let lock = NSLock()
@@ -32,9 +33,12 @@ final class FrameProcessor: @unchecked Sendable {
 
     private let signpost = OSSignposter(subsystem: "com.aicamera", category: "frame")
 
-    init(faceDetector: FaceDetector, sink: FrameSink) {
+    init(faceDetector: FaceDetector,
+         sink: FrameSink,
+         histogramSampler: HistogramSampler? = nil) {
         self.faceDetector = faceDetector
         self.sink = sink
+        self.histogramSampler = histogramSampler
     }
 
     func updateContext(_ ctx: FrameContext) {
@@ -45,6 +49,9 @@ final class FrameProcessor: @unchecked Sendable {
 
     func process(_ frame: VideoFrame) {
         let ctx = currentContext()
+
+        // 直方图采样（采样器内部已限频；与渲染并列，无依赖）
+        histogramSampler?.submit(frame.pixelBuffer)
 
         // 短路：原图直出
         if ctx.isPassthrough {

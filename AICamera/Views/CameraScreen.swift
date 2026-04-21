@@ -9,7 +9,7 @@ struct CameraScreen: View {
         ZStack {
             Theme.Color.background.ignoresSafeArea()
 
-            // 预览（可点对焦 / 双指变焦）
+            // 预览（可点对焦 / 双指变焦 / 长按锁 AE/AF）
             PreviewLayer()
                 .background(GeometryReader { proxy in
                     Color.clear
@@ -30,6 +30,10 @@ struct CameraScreen: View {
                             pinchStart = vm.configuration.zoomFactor
                         }
                 )
+                .simultaneousGesture(
+                    LongPressGesture(minimumDuration: 0.6)
+                        .onEnded { _ in vm.toggleAEAFLock() }
+                )
                 .overlay(alignment: .topLeading) {
                     if vm.configuration.isGridVisible {
                         GridOverlay().allowsHitTesting(false)
@@ -45,11 +49,36 @@ struct CameraScreen: View {
                         CountdownOverlay(value: vm.countdownRemaining)
                     }
                 }
+                .overlay(alignment: .bottom) {
+                    if vm.mode == .pro, !vm.caps.lensStops.isEmpty {
+                        LensZoomBar(stops: vm.caps.lensStops,
+                                    currentZoom: vm.configuration.zoomFactor,
+                                    onSelect: { vm.selectZoomStop($0) })
+                            .padding(.bottom, 8)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
+                }
 
             VStack(spacing: 0) {
                 TopBar()
                     .padding(.horizontal, Theme.Spacing.l)
                     .padding(.top, Theme.Spacing.s)
+
+                if vm.mode == .pro {
+                    HStack(alignment: .top) {
+                        if vm.pro.lockedAEAF {
+                            AEAFLockBadge()
+                        }
+                        Spacer()
+                        LevelView(reading: vm.level)
+                        Spacer()
+                        HistogramView(bins: vm.histogram)
+                    }
+                    .padding(.horizontal, Theme.Spacing.l)
+                    .padding(.top, Theme.Spacing.s)
+                    .transition(.opacity)
+                }
+
                 Spacer(minLength: 0)
                 BottomBar()
             }
@@ -65,6 +94,7 @@ struct CameraScreen: View {
         .animation(Theme.Animation.fade, value: vm.toast)
         .animation(Theme.Animation.snappy, value: vm.mode)
         .animation(Theme.Animation.snappy, value: vm.configuration.isGridVisible)
+        .animation(.easeOut(duration: 0.2), value: vm.pro.lockedAEAF)
         .sheet(isPresented: Binding(
             get: { vm.isShowingPreview },
             set: { if !$0 { vm.dismissPreview() } }

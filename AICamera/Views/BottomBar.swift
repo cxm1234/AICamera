@@ -10,13 +10,16 @@ struct BottomBar: View {
                 switch vm.mode {
                 case .filter:
                     FilterStrip()
+                        .padding(.horizontal, Theme.Spacing.l)
                 case .beauty:
                     BeautyPanel()
+                        .padding(.horizontal, Theme.Spacing.l)
                 case .photo:
                     Color.clear.frame(height: 1)
+                case .pro:
+                    ProPanel()
                 }
             }
-            .padding(.horizontal, Theme.Spacing.l)
 
             ModeSelector()
                 .padding(.horizontal, Theme.Spacing.l)

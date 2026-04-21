@@ -4,6 +4,7 @@ enum CameraMode: String, CaseIterable, Identifiable, Sendable {
     case beauty
     case photo
     case filter
+    case pro
 
     var id: String { rawValue }
 
@@ -12,6 +13,7 @@ enum CameraMode: String, CaseIterable, Identifiable, Sendable {
         case .beauty: return "美颜"
         case .photo:  return "拍照"
         case .filter: return "滤镜"
+        case .pro:    return "专业"
         }
     }
 }
