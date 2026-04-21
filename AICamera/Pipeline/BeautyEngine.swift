@@ -42,18 +42,18 @@ struct BeautyEngine: Sendable {
         return result.cropped(to: image.extent)
     }
 
-    // MARK: - 磨皮（频率分离 + 高频衰减 + 人脸柔边 mask）
+    // MARK: - 磨皮（高斯模糊 + 椭圆柔边 mask + 五官"洞"）
     //
-    // 算法：
-    //   low  = GaussianBlur(image, large)         // 低频：肤色与瑕疵
-    //   high = image - low + 0.5                  // 高频：皮肤纹理与边缘
-    //   high'= (high - 0.5) * (1 - k * i) + 0.5   // 衰减高频强度（k=0.85）
-    //   smooth = low + (high' - 0.5)              // 重构：保留结构、去掉颗粒
-    //   mask = 椭圆柔边（按 face boundingBox），无脸时退化为整图
-    //   final = blend(smooth, image, mask * pow(i, 0.65))
+    // 之所以放弃频率分离：CI 内建的 SubtractBlendMode 是 max(0, B-S)，
+    // AdditionCompositing 是 min(1, S+B)，两次饱和截断会把皮肤亮区压成
+    // 灰平面甚至纯黑。这里改用稳定且效果显著的方案：
+    //   1. 在 0.5x 空间对全图做高斯模糊（半径随 intensity 增大）；
+    //   2. 上采样回原尺寸；
+    //   3. 构造一张柔边人脸 mask：椭圆区域 = peak（=0.85·pow(i,0.65)），
+    //      眼睛 / 嘴的位置乘上一个内黑外白的洞 mask，从而保留五官细节；
+    //   4. blendWithMask(smoothed, original, mask)。
     //
-    // 这是 Snapseed / Facetune 同源的"频率分离"磨皮。intensity=1 时高频近乎抹平
-    // 形成瓷感；intensity=0.5 时衰减 ~42%，肤色细腻但五官锐度保留。
+    // peak ≤ 0.85：即便 intensity=1，仍保留 15% 原始纹理，避免"塑料感"。
     private func smoothSkin(_ image: CIImage,
                             intensity: Double,
                             faces: [FaceObservation],
@@ -61,7 +61,7 @@ struct BeautyEngine: Sendable {
         let i = max(0, min(1, intensity))
         let extent = image.extent
 
-        // 1) 降采样（默认 0.5x）
+        // 1) 降采样
         let s = max(0.3, min(1.0, scale))
         let down: CIImage
         if abs(s - 1.0) > 0.01 {
@@ -75,56 +75,28 @@ struct BeautyEngine: Sendable {
         }
         let downExtent = down.extent
 
-        // 2) 低频（强高斯模糊）
+        // 2) 强高斯模糊（0.5x 空间下半径 2..10 ≈ 原图 4..20）
         let blur = CIFilter.gaussianBlur()
         blur.inputImage = down.clampedToExtent()
-        blur.radius = Float(3.0 + 9.0 * i)              // 3..12 in 0.5x 空间
-        let lowFreq = (blur.outputImage ?? down).cropped(to: downExtent)
+        blur.radius = Float(2.0 + 8.0 * i)
+        let blurred = (blur.outputImage ?? down).cropped(to: downExtent)
 
-        // 3) 高频 = down - lowFreq + 0.5
-        let sub = CIFilter.subtractBlendMode()
-        sub.inputImage = down
-        sub.backgroundImage = lowFreq
-        let detailRaw = (sub.outputImage ?? down).cropped(to: downExtent)
-        let detailShifted = detailRaw.applyingFilter("CIColorMatrix", parameters: [
-            "inputBiasVector": CIVector(x: 0.5, y: 0.5, z: 0.5, w: 0)
-        ])
-
-        // 4) 高频衰减
-        let strength = CGFloat(1.0 - 0.85 * i)
-        let bias = 0.5 * (1 - strength)
-        let detailAtt = detailShifted.applyingFilter("CIColorMatrix", parameters: [
-            "inputRVector":    CIVector(x: strength, y: 0, z: 0, w: 0),
-            "inputGVector":    CIVector(x: 0, y: strength, z: 0, w: 0),
-            "inputBVector":    CIVector(x: 0, y: 0, z: strength, w: 0),
-            "inputAVector":    CIVector(x: 0, y: 0, z: 0, w: 1),
-            "inputBiasVector": CIVector(x: bias, y: bias, z: bias, w: 0)
-        ])
-
-        // 5) 重组 lowFreq + (detailAtt - 0.5)
-        let add = CIFilter.additionCompositing()
-        add.inputImage = detailAtt
-        add.backgroundImage = lowFreq
-        let combined = (add.outputImage ?? down).cropped(to: downExtent)
-        let smoothedDown = combined.applyingFilter("CIColorMatrix", parameters: [
-            "inputBiasVector": CIVector(x: -0.5, y: -0.5, z: -0.5, w: 0)
-        ])
-
-        // 6) 上采样回原尺寸
+        // 3) 上采样回原尺寸
         let smoothed: CIImage
         if abs(s - 1.0) > 0.01 {
             let u = CIFilter.lanczosScaleTransform()
-            u.inputImage = smoothedDown
+            u.inputImage = blurred
             u.scale = Float(1.0 / s)
             u.aspectRatio = 1.0
-            smoothed = (u.outputImage ?? smoothedDown).cropped(to: extent)
+            smoothed = (u.outputImage ?? blurred).cropped(to: extent)
         } else {
-            smoothed = smoothedDown
+            smoothed = blurred
         }
 
-        // 7) 用 face mask 限制只磨脸；强度走感知曲线 pow(i, 0.65)
+        // 4) 构造 mask（眼睛/嘴有"洞"）
         let mask = makeFaceMask(in: extent, faces: faces, intensity: i)
 
+        // 5) 混合
         let blend = CIFilter.blendWithMask()
         blend.inputImage = smoothed
         blend.backgroundImage = image
@@ -132,41 +104,30 @@ struct BeautyEngine: Sendable {
         return (blend.outputImage ?? image).cropped(to: extent)
     }
 
-    /// 构造柔边人脸 mask（白=磨皮，黑=保留原图）。
-    /// - 无脸：整图均匀强度 = pow(i, 0.65)
-    /// - 有脸：每张脸一个 radial gradient，叠加并 clamp 到 [0,1]
+    /// 构造灰度 mask（白 = 用 smoothed，黑 = 用原图）。
+    /// - 峰值上限 0.85 · pow(i, 0.65)，避免完全压平；
+    /// - 无脸时 fallback 为均匀 0.55·peak（不至于把整图磨糊）；
+    /// - 有脸时：椭圆 radial gradient，再 multiply 一个"内黑外白"的洞 mask
+    ///   保留眼睛和嘴的锐度。
     private func makeFaceMask(in extent: CGRect,
                               faces: [FaceObservation],
                               intensity: Double) -> CIImage {
-        let strength = CGFloat(pow(intensity, 0.65))
+        let peak = CGFloat(0.85 * pow(intensity, 0.65))
 
         if faces.isEmpty {
-            return CIImage(color: CIColor(red: strength, green: strength, blue: strength, alpha: 1))
+            let global = peak * 0.55
+            return CIImage(color: CIColor(red: global, green: global, blue: global, alpha: 1))
                 .cropped(to: extent)
         }
 
-        var combined = CIImage(color: .black).cropped(to: extent)
         let span = max(extent.width, extent.height)
+        var combined = CIImage(color: .black).cropped(to: extent)
+
         for face in faces {
-            let center = CGPoint(
-                x: extent.origin.x + face.boundingBox.midX * extent.width,
-                y: extent.origin.y + face.boundingBox.midY * extent.height
-            )
-            // 用脸部包围盒短边作为基准，r0 = 实心区域，r1 = 完全衰减半径
-            let faceSpan = max(face.boundingBox.width, face.boundingBox.height) * span
-            let r0 = faceSpan * 0.45
-            let r1 = faceSpan * 0.78
-
-            let g = CIFilter.radialGradient()
-            g.center  = center
-            g.radius0 = Float(r0)
-            g.radius1 = Float(r1)
-            g.color0  = CIColor(red: strength, green: strength, blue: strength, alpha: 1)
-            g.color1  = CIColor(red: 0, green: 0, blue: 0, alpha: 1)
-            let layer = (g.outputImage ?? combined).cropped(to: extent)
-
-            let merge = CIFilter.additionCompositing()
-            merge.inputImage = layer
+            let faceLayer = makeSingleFaceMask(face: face, in: extent, span: span, peak: peak)
+            // 多张脸用 lighten，取较亮像素，避免 multiply 互相压暗
+            let merge = CIFilter.lightenBlendMode()
+            merge.inputImage = faceLayer
             merge.backgroundImage = combined
             combined = (merge.outputImage ?? combined).cropped(to: extent)
         }
@@ -176,6 +137,77 @@ struct BeautyEngine: Sendable {
         clamp.minComponents = CIVector(x: 0, y: 0, z: 0, w: 0)
         clamp.maxComponents = CIVector(x: 1, y: 1, z: 1, w: 1)
         return (clamp.outputImage ?? combined).cropped(to: extent)
+    }
+
+    /// 单张脸：椭圆磨皮区域 multiply 多个"内黑外白"的洞（眼睛、嘴）。
+    private func makeSingleFaceMask(face: FaceObservation,
+                                    in extent: CGRect,
+                                    span: CGFloat,
+                                    peak: CGFloat) -> CIImage {
+        let center = CGPoint(
+            x: extent.origin.x + face.boundingBox.midX * extent.width,
+            y: extent.origin.y + face.boundingBox.midY * extent.height
+        )
+        let faceSpan = max(face.boundingBox.width, face.boundingBox.height) * span
+        let r0 = faceSpan * 0.40
+        let r1 = faceSpan * 0.72
+
+        let g = CIFilter.radialGradient()
+        g.center  = center
+        g.radius0 = Float(r0)
+        g.radius1 = Float(r1)
+        g.color0  = CIColor(red: peak, green: peak, blue: peak, alpha: 1)
+        g.color1  = CIColor(red: 0, green: 0, blue: 0, alpha: 1)
+        var layer = (g.outputImage ?? CIImage(color: .black)).cropped(to: extent)
+
+        // 五官洞：用 multiplyCompositing，洞中心黑（=0，乘后变 0），外围白（=1，乘后保留）
+        for hole in featureHoles(for: face, in: extent, span: span) {
+            let h = CIFilter.radialGradient()
+            h.center  = hole.center
+            h.radius0 = Float(hole.radius0)
+            h.radius1 = Float(hole.radius1)
+            h.color0  = CIColor(red: 0, green: 0, blue: 0, alpha: 1)
+            h.color1  = CIColor(red: 1, green: 1, blue: 1, alpha: 1)
+            let holeMask = (h.outputImage ?? layer).cropped(to: extent)
+
+            let mul = CIFilter.multiplyCompositing()
+            mul.inputImage = holeMask
+            mul.backgroundImage = layer
+            layer = (mul.outputImage ?? layer).cropped(to: extent)
+        }
+        return layer
+    }
+
+    private struct FeatureHole {
+        let center: CGPoint
+        let radius0: CGFloat
+        let radius1: CGFloat
+    }
+
+    private func featureHoles(for face: FaceObservation,
+                              in extent: CGRect,
+                              span: CGFloat) -> [FeatureHole] {
+        var holes: [FeatureHole] = []
+        let faceSpan = max(face.boundingBox.width, face.boundingBox.height) * span
+        let eyeR0 = faceSpan * 0.05
+        let eyeR1 = eyeR0 * 2.4
+        for eye in [face.leftEye, face.rightEye].compactMap({ $0 }) {
+            let c = CGPoint(
+                x: extent.origin.x + eye.x * extent.width,
+                y: extent.origin.y + eye.y * extent.height
+            )
+            holes.append(FeatureHole(center: c, radius0: eyeR0, radius1: eyeR1))
+        }
+        if let mouth = face.mouth {
+            let c = CGPoint(
+                x: extent.origin.x + mouth.x * extent.width,
+                y: extent.origin.y + mouth.y * extent.height
+            )
+            let mr0 = faceSpan * 0.08
+            let mr1 = mr0 * 2.0
+            holes.append(FeatureHole(center: c, radius0: mr0, radius1: mr1))
+        }
+        return holes
     }
 
     // MARK: - 美白（提亮 + 略微降饱和保留肤色，再轻微暖色补偿）
